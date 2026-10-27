@@ -900,6 +900,20 @@ func fieldName(l Leaf) string {
 	return l.Path
 }
 
+// offsetNamed is what the offset off is to the application, as a reason
+// names it: a time to live (a due date, an expiry) where it is above zero,
+// a look-back (a cutoff such as createdAt >= now - 2m) where it is below,
+// an offset where its range holds both.
+func offsetNamed(off models.ClockOffset) string {
+	switch {
+	case off.Min > 0:
+		return "a time to live"
+	case off.Max < 0:
+		return "a look-back"
+	}
+	return "an offset"
+}
+
 // clockOffsetSeen is what the learn step saw of a value at off from the
 // application's clock: "expires_at = clock + 30m ...".
 func clockOffsetSeen(path string, off models.ClockOffset) string {
@@ -909,7 +923,7 @@ func clockOffsetSeen(path string, off models.ClockOffset) string {
 // clockOffsetEvidence is a KindClockOffset's Why: what was seen, and how the
 // replay compares it.
 func clockOffsetEvidence(path string, off models.ClockOffset) string {
-	return clockOffsetSeen(path, off) + ". A replay compares the offset: a time to live changed by " + aUnit(off.Unit()) + " or more still fails; if the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
+	return clockOffsetSeen(path, off) + ". A replay compares the offset: " + offsetNamed(off) + " changed by " + aUnit(off.Unit()) + " or more still fails; if the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
 }
 
 // clockOffsetFineWhy is why an instant at the clock plus an offset off is
@@ -917,7 +931,7 @@ func clockOffsetEvidence(path string, off models.ClockOffset) string {
 // changed, and ": an application that cuts its value to that unit (a whole
 // second) makes a time to live changed by one look the same.
 func clockOffsetFineWhy(path string, off models.ClockOffset) string {
-	return clockOffsetSeen(path, off) + ", but the offset reads in " + unitWord(off.Unit()) + "s, and an application that cuts its value to the " + unitWord(off.Unit()) + " makes a time to live changed by " + aUnit(off.Unit()) + " look the same, so keploy refuses an offset that reads in a second or finer. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
+	return clockOffsetSeen(path, off) + ", but the offset reads in " + unitWord(off.Unit()) + "s, and an application that cuts its value to the " + unitWord(off.Unit()) + " makes " + offsetNamed(off) + " changed by " + aUnit(off.Unit()) + " look the same, so keploy refuses an offset that reads in a second or finer. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
 }
 
 // clockOffsetCutWhy is why an instant at the clock plus an offset off is
@@ -959,7 +973,7 @@ func apartByUnits(gap, enc time.Duration) bool {
 // recorded one, is above zero for any offset both runs show.
 func clockOffsetApartWhy(path string, off models.ClockOffset, gap, enc time.Duration) string {
 	u := unitWord(models.UnitAbove(enc))
-	return clockOffsetSeen(path, off) + ", but its two values stand " + models.ShortDuration(gap) + " apart, a whole number of " + u + "s, the unit above the " + models.ShortDuration(enc) + " their encoding writes: an application that cuts its value to the " + u + " and adds a time to live that is no whole number of " + u + "s shows that, and a replay could then hold a time to live changed by " + aUnit(off.Unit()) + ", so keploy refuses it. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
+	return clockOffsetSeen(path, off) + ", but its two values stand " + models.ShortDuration(gap) + " apart, a whole number of " + u + "s, the unit above the " + models.ShortDuration(enc) + " their encoding writes: an application that cuts its value to the " + u + " and offsets it by " + offsetNamed(off) + " that is no whole number of " + u + "s shows that, and a replay could then hold " + offsetNamed(off) + " changed by " + aUnit(off.Unit()) + ", so keploy refuses it. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
 }
 
 // clockOffsetWideWhy is why an instant at the clock plus an offset in off is
@@ -968,7 +982,7 @@ func clockOffsetApartWhy(path string, off models.ClockOffset, gap, enc time.Dura
 // its call's windows, or the cut both runs' values share, bound the offset
 // too loosely for a replay to tell a time to live changed by that unit.
 func clockOffsetWideWhy(path string, off models.ClockOffset, enc time.Duration) string {
-	return path + " = " + off.Range() + " at a resolution of " + resolutionOf(off.Res, enc) + ": in the recording and in record's full round alike, it is a read of the application's clock in its call's window plus an offset in that range, but the range and the resolution are not narrower than the " + unitWord(off.Unit()) + " the offset reads in, so a replay could not tell a time to live changed by " + aUnit(off.Unit()) + " from it, and keploy refuses it. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
+	return path + " = " + off.Range() + " at a resolution of " + resolutionOf(off.Res, enc) + ": in the recording and in record's full round alike, it is a read of the application's clock in its call's window plus an offset in that range, but the range and the resolution are not narrower than the " + unitWord(off.Unit()) + " the offset reads in, so a replay could not tell " + offsetNamed(off) + " changed by " + aUnit(off.Unit()) + " from it, and keploy refuses it. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
 }
 
 // resolutionOf is res as a reason reads it, saying what set it: the
@@ -1013,7 +1027,7 @@ func unitWord(u time.Duration) string {
 // whose replay does not compare an offset (Window.ComparesOffsets), read
 // after "<field> changed, and ".
 func clockOffsetUncomparedWhy(path string, off models.ClockOffset) string {
-	return clockOffsetSeen(path, off) + ", and this protocol's replay does not compare such an offset yet: as noise, a changed time to live would pass, so keploy refuses it. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
+	return clockOffsetSeen(path, off) + ", and this protocol's replay does not compare such an offset yet: as noise, " + offsetNamed(off) + " changed by any amount would pass, so keploy refuses it. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
 }
 
 // clockOffsetEchoedWhy is why such an instant is refused where the call's
@@ -1188,11 +1202,11 @@ func (dc *DriftCache) instantEchoFrom(r Leaf, echoed []echoMatch, at time.Time, 
 		}
 		for _, f := range x.fields {
 			if !f.key && dc.holdsRecorded(x.text[f.start:f.end], echoed) {
-				return Place{Mock: x.mock, Field: f.describe(), Echo: true}, true
+				return Place{Mock: x.mock, Field: f.describe(), Echo: true, unserved: !x.served}, true
 			}
 		}
 		if dc.holdsRecorded(x.text, echoed) || dc.holdsRecorded(dc.rawExtra(x.text), echoed) {
-			return Place{Mock: x.mock, Echo: true}, true
+			return Place{Mock: x.mock, Echo: true, unserved: !x.served}, true
 		}
 	}
 	return Place{}, false
@@ -1254,7 +1268,7 @@ func (dc *DriftCache) instantRawFrom(r Leaf, rec moment, at time.Time, raw []Raw
 				break
 			}
 		}
-		return Place{Mock: x.mock, Field: field, Held: r.Value}, true
+		return Place{Mock: x.mock, Field: field, Held: r.Value, unserved: !x.served}, true
 	}
 	return Place{}, false
 }
@@ -1300,7 +1314,7 @@ func (dc *DriftCache) holdsExact(text string, m moment) bool {
 func instantEvidence(from Place) string {
 	at := placeAt(from)
 	if from.Echo {
-		return echoFound(at) + "; " + echoProvenance + ", so keploy follows it as a value from there. " + correction(from.Mock)
+		return echoFound(at) + "; " + echoProvenance + ", so keploy follows it as a value from there. " + correction(from.Mock, from.unserved)
 	}
-	return "the moment it was recorded with stands in " + at + ", as an instant of its own; an instant equal to one an earlier place holds is followed as a value from there, whether or not it is a read of the clock. " + correction(from.Mock)
+	return "the moment it was recorded with stands in " + at + ", as an instant of its own; an instant equal to one an earlier place holds is followed as a value from there, whether or not it is a read of the clock. " + correction(from.Mock, from.unserved)
 }

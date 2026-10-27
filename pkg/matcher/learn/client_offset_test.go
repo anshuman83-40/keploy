@@ -405,3 +405,38 @@ func TestAClockOffsetIsOnOneSideOfItsWindowInBothRuns(t *testing.T) {
 		}
 	}
 }
+
+// A reason names an offset as what it is to the application: one above
+// zero a time to live, one below zero a look-back (a cutoff such as
+// createdAt >= now - 2m), never a time to live; a range that holds zero an
+// offset. Each reason the offset rule gives reads so.
+func TestAnOffsetBelowZeroIsNamedALookBackNotATimeToLive(t *testing.T) {
+	const p = "body.cmd.query.createdAt.{}"
+	ms, min2 := time.Millisecond, 2*time.Minute
+	for _, tc := range []struct {
+		name string
+		off  models.ClockOffset
+		want string
+	}{
+		{"below zero", models.ClockOffset{Min: -min2 - 40*ms, Max: -min2 + 11*ms, Res: ms}, "a look-back"},
+		{"above zero", models.ClockOffset{Min: min2 - 40*ms, Max: min2 + 11*ms, Res: ms}, "a time to live"},
+		{"a range holding zero", models.ClockOffset{Min: -30 * time.Second, Max: 30 * time.Second, Res: time.Minute}, "an offset"},
+	} {
+		for name, why := range map[string]string{
+			"evidence":   clockOffsetEvidence(p, tc.off),
+			"fine":       clockOffsetFineWhy(p, tc.off),
+			"apart":      clockOffsetApartWhy(p, tc.off, time.Minute, time.Second),
+			"wide":       clockOffsetWideWhy(p, tc.off, ms),
+			"uncompared": clockOffsetUncomparedWhy(p, tc.off),
+		} {
+			if !strings.Contains(why, " "+tc.want+" changed by ") || tc.want != "a time to live" && strings.Contains(why, "time to live") {
+				t.Errorf("%s, %s: %s; want it to name the offset %s, and no time to live", tc.name, name, why, tc.want)
+			}
+		}
+	}
+	c := newClockOffsetCall()
+	ln := c.classifyClient(p, millisText(p, c.read.Add(-min2)), millisText(p, c.fread.Add(-min2)), c.w.ComparesOffsets())
+	if ln.Kind != KindClockOffset || !strings.Contains(ln.Why, ". A replay compares the offset: a look-back changed by a minute or more still fails; ") {
+		t.Errorf("a client test's cutoff two minutes before: %s (%s); want its evidence to name a look-back", ln.Kind, ln.Why)
+	}
+}
