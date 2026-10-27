@@ -640,12 +640,40 @@ func holdsAny(o models.ClockOffset, ats []time.Time, res time.Duration, from, to
 // a live value that reads as no instant (another type, a text that is not
 // one instant whole), one clockReadIn reads in no zone, and for every value
 // where s is no span (its From is zero): it fails closed.
+//
+// A read learned before its call's window (o.Since, models.SinceTestBegin)
+// is read in s from the running test's begin (Span.sinceBegin): false where
+// s knows no begin, and for an o of a Since this keploy does not read.
 func ClockReadHolds(o models.ClockOffset, live Leaf, s Span) bool {
+	s, why := spanOf(o, s)
+	if why != "" {
+		return false
+	}
 	ats, res, why := clockReadIn(o, live, s)
 	if why != "" {
 		return false
 	}
 	return holdsAny(o, ats, res, s.From, s.To)
+}
+
+// spanOf is the span a replay checks o, a learned read of the clock, in: s,
+// its call's span, or, for a read learned before its call's window
+// (models.SinceTestBegin), s from the running test's begin (Span.sinceBegin).
+// Otherwise why it checks none (read after "<path> was learned as <o>, a
+// read of the application's clock"): s knows no begin of its test, or o's
+// Since is one this keploy does not read.
+func spanOf(o models.ClockOffset, s Span) (Span, string) {
+	switch {
+	case !o.SinceKnown():
+		return Span{}, ": keploy refuses the value whatever it is rather than check it in a span its learn step did not read. Record the test again with this keploy"
+	case o.Since != models.SinceTestBegin:
+		return s, ""
+	}
+	b, ok := s.sinceBegin()
+	if !ok {
+		return Span{}, ", which a replay checks from where its test began on the application's clock, but keploy cannot tell that at this call (no test began, or the application's clock did not run as one from the test's begin to the call), so it refuses the value rather than pass it unchecked"
+	}
+	return b, ""
 }
 
 // CheckClockRead is a replay's check of live, the leaf its call carries at
@@ -680,6 +708,10 @@ func CheckClockRead(path string, o models.ClockOffset, live Leaf, s Span, known 
 	if !known {
 		return false, learned + ", which a replay checks against its call's window on the application's clock, but keploy cannot tell the application's clock at this call (no time hooks report it, or they could not tell it here), so it refuses the value rather than pass it unchecked"
 	}
+	s, why := spanOf(o, s)
+	if why != "" {
+		return false, learned + why
+	}
 	ats, res, why := clockReadIn(o, live, s)
 	if why != "" {
 		return false, learned + why
@@ -690,7 +722,11 @@ func CheckClockRead(path string, o models.ClockOffset, live Leaf, s Span, known 
 	if holdsAny(o, ats, res, s.From, s.To) {
 		return true, ""
 	}
-	return false, learned + ", and the value this call carries is not " + read + " made in this call's window: it changed"
+	made := " made in this call's window"
+	if o.Since == models.SinceTestBegin {
+		made = " made after this test began and no later than this call"
+	}
+	return false, learned + ", and the value this call carries is not " + read + made + ": it changed"
 }
 
 // ClockSpanFrom is the span on the application's clock in which the call
