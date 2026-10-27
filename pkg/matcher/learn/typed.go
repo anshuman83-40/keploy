@@ -536,26 +536,39 @@ func (dc *DriftCache) classifyInstant(r, l Leaf, at time.Time, served []Earlier,
 	// checks no read of the clock refuses it with that reason still
 	// (KindClockRead). "" for any other.
 	noWindow := ""
+	// A read of the clock plus a constant offset (a time to live, a due
+	// date; a cutoff below zero, createdAt >= now - 2m), in its call's
+	// window in both runs: compared, never noise, and tried first, before
+	// any plain read of the clock. A value its window holds shows no offset
+	// (clockOffsetOf), nor does one of a call with no window. In keploy
+	// test, the lead shows a read made no later than its call in a cutoff
+	// made minutes before its window as it shows one made in it: such a
+	// value is the offset its window shows where the offset rule learns
+	// one, and only otherwise the plain read the lead shows, as before. In
+	// keploy mock's client tests too: a value the harness gives the
+	// application is compared all the same (the replay checks the offset,
+	// never lets it pass), and one built on a read made before its call's
+	// window shows no offset coarser than a second (clockOffset refuses
+	// it), as a read the application made earlier stands from the window by
+	// how long ago it was made.
+	off, offset := clockOffsetOf(rt, lt, w)
+	var tried Learned
+	if offset {
+		if tried = dc.clockOffset(ln, off, max(rt.res, lt.res), lt.at.Sub(rt.at), w, unread, rec, resp); tried.Kind == KindClockOffset {
+			return tried
+		}
+	}
 	if !instantClock(rt, lt, w, !dc.clientTests, at, dc.zone) {
-		// A read of the clock plus a constant offset (a time to live, a
-		// due date), in its call's window in both runs: compared, never
-		// noise. In keploy mock's client tests too: a value the harness
-		// gives the application is compared all the same (the replay
-		// checks the offset, never lets it pass), and one built on a read
-		// made before its call's window shows no offset coarser than a
-		// second (clockOffset refuses it), as a read the application made
-		// earlier stands from the window by how long ago it was made.
-		// There the offset rule only learns: where it refuses, the client
-		// test's own refusal stands (clientTestWhy), which says how to
-		// correct a value the harness supplies. So does an offset below
-		// zero's everywhere: a value before its call's window is refused
-		// with the reason it was before keploy learned one (a read made
-		// earlier stands from the window by how long ago it was made), and
-		// is learned only where the offset rule learns it.
-		if off, ok := clockOffsetOf(rt, lt, w); ok {
-			if got := dc.clockOffset(ln, off, max(rt.res, lt.res), lt.at.Sub(rt.at), w, unread, rec, resp); got.Kind == KindClockOffset || !dc.clientTests && off.Min > 0 {
-				return got
-			}
+		// Where the offset rule refuses an offset neither the lead nor a
+		// window shows a plain read beside, the client test's own refusal
+		// stands (clientTestWhy), which says how to correct a value the
+		// harness supplies; so does an offset below zero's everywhere: a
+		// value before its call's window is refused with the reason it was
+		// before keploy learned one (a read made earlier stands from the
+		// window by how long ago it was made). keploy test refuses an offset
+		// above zero naming it.
+		if offset && !dc.clientTests && off.Min > 0 {
+			return tried
 		}
 		why := instantNotClock
 		switch {
@@ -831,9 +844,11 @@ func (dc *DriftCache) clockOffset(ln Learned, off models.ClockOffset, enc, gap t
 // textClockOffset is classifyRead's reading, in keploy mock's client tests,
 // of a drifted text (r as recorded, l as record's full round saw it, v what
 // changed) that its call's window w holds as no plain read of the
-// application's clock (clientTestUnread): where each is one instant whole
-// that names its moment (readClockTextWall: an epoch's digits, a time with
-// its zone), both written in one layout, and w holds the two as a read of
+// application's clock (clientTestUnread), and, in any test, of one the lead
+// or a window shows a plain read of it, tried as an offset first (a value
+// made before its call's window: classifyRead): where each is one instant
+// whole that names its moment (readClockTextWall: an epoch's digits, a time
+// with its zone), both written in one layout, and w holds the two as a read of
 // each run's clock plus one constant offset (clockOffsetOf), that offset,
 // learned as classifyInstant learns a typed one (clockOffset: only for a
 // caller whose replay compares it, in a unit coarser than a second, and the
@@ -842,7 +857,8 @@ func (dc *DriftCache) clockOffset(ln Learned, off models.ClockOffset, enc, gap t
 // a wall clock of no zone, which stands from the clock by its zone's offset
 // as much as by one the application adds; the two runs wrote two layouts; w
 // shows no one offset; or clockOffset refuses it), and the client test's
-// refusal stands, as the typed reading's does (classifyInstant).
+// refusal, or the plain read, stands, as the typed reading's does
+// (classifyInstant).
 func (dc *DriftCache) textClockOffset(r, l Leaf, v *valueDrift, w *Window, resp []Leaf) (Learned, bool) {
 	rat, rres, rwall, okR := readClockTextWall(r.Value)
 	lat, lres, lwall, okL := readClockTextWall(l.Value)
