@@ -521,6 +521,10 @@ type Place struct {
 	// noTime: that mock's recorded time keploy cannot read, read as the
 	// call's own instant (Raw.noTime): a reason says so (placeAt).
 	noTime bool
+	// unserved, of a place found in a raw mock's payload: record's full
+	// round never served that mock before the call (Raw.Served false): a
+	// reason says so (correction).
+	unserved bool
 	// startUp, of a place found in a raw mock's payload: the mock is a
 	// connection's recorded start-up (Raw.startUp) and the value's word
 	// stands there in a field a swap of start-ups can change (swapHolds),
@@ -1105,23 +1109,24 @@ func classifyRead(dc *DriftCache, drift []string, live, rec Shape, at time.Time,
 		return op
 	}
 	out := make([]Learned, 0, len(drift))
-	for _, p := range drift {
-		r, l := rec.Leaves[p], live.Leaves[p]
+	// leaf classifies one changed leaf, r as recorded and l as F saw it, as
+	// a value of the call whose window is w. noSource: as a value no
+	// earlier place is the source of (no variable's search), every other
+	// rule as it stands.
+	leaf := func(r, l Leaf, w *Window, noSource bool) Learned {
 		if unreadRaw != "" {
-			out = append(out, Learned{Kind: KindUnaccounted, Recorded: r, Live: l, Why: unreadRaw})
-			continue
+			return Learned{Kind: KindUnaccounted, Recorded: r, Live: l, Why: unreadRaw}
 		}
 		if r.Type == Instant || l.Type == Instant {
-			out = append(out, dc.classifyInstant(r, l, at, served, raw, resp, w, unreadReq, places))
-			continue
+			return dc.classifyInstant(r, l, at, served, raw, resp, w, unreadReq, places, noSource)
 		}
 		ln := Learned{Kind: KindNoise, Recorded: r, Live: l}
 		var fol *follows
 		if follow {
-			fol = &follows{dc: dc, rec: r.Value, live: l.Value, at: at}
+			fol = &follows{dc: dc, rec: r.Value, live: l.Value, at: at, served: served, raw: raw, places: places}
 		}
 		if r.Value != "" {
-			if from, ok := appearedIn(dc, dc.ofIn(r.Value, l.Value, w, at), at, served, raw, fol); ok {
+			if from, ok := appearedIn(dc, dc.ofIn(r.Value, l.Value, w, at), at, served, raw, fol); ok && !noSource {
 				ln.Kind, ln.From = KindVariable, from
 				if from.Side == "" || from.Echo {
 					ln.Why = evidence(dc.ofIn(r.Value, l.Value, w, at), from)
@@ -1160,14 +1165,28 @@ func classifyRead(dc *DriftCache, drift []string, live, rec Shape, at time.Time,
 				// an instant of it copied from there, or picked from it,
 				// which the word rule leaves to the clock (the echo of
 				// those places).
-				if why = givenWhy(dc, v, at, served, raw, places); why == "" {
+				if why = givenWhy(dc, v, at, served, raw, places, fol); why == "" {
 					why = dc.echoedElsewhere(v.instants, at, served, raw, places)
+				} else if fol != nil && fol.refused != "" {
+					why += "; " + fol.refused
 				}
 			}
 			// In keploy mock's client tests, a changed instant only where the
 			// call's window shows it a read of the application's clock.
 			if why == "" && dc.clientTests {
 				why = dc.clientTestUnread(v, w)
+				// One instant whole in both runs that its window holds as
+				// a read of the clock plus a constant offset (an
+				// expires_at, as its millisecond text): that offset,
+				// compared at every replay (textClockOffset), never noise,
+				// so no order of the places the word rule let a word of it
+				// go at (follows.followed, which orders noise) is needed:
+				// a replay passes it only as the clock plus that offset.
+				if why != "" {
+					if off, ok := dc.textClockOffset(r, l, v, w, resp); ok {
+						return off
+					}
+				}
 			}
 			if why != "" {
 				ln.Kind, ln.Why, ln.Echo = KindUnaccounted, why, nil
@@ -1200,6 +1219,8 @@ func classifyRead(dc *DriftCache, drift []string, live, rec Shape, at time.Time,
 					ln.Why = fol.refuted + ", and keploy learns it as varying"
 				case fol.moved != "":
 					ln.Why = fol.moved + ", and keploy learns it as varying"
+				case fol.chance != "":
+					ln.Why = fol.chance + ", and keploy learns it as varying"
 				}
 			case KindEcho:
 				why := fol.first
@@ -1209,9 +1230,29 @@ func classifyRead(dc *DriftCache, drift []string, live, rec Shape, at time.Time,
 				ln.Kind, ln.Why, ln.Echo = KindUnaccounted, why, nil
 			}
 		}
+		// A leaf set aside as no source (follows.refuteSeen), and nothing
+		// else: an echo beside it is refused as beside any source set aside;
+		// a value left noise is ordered below, once its kind is final.
+		asideOnly := fol != nil && fol.first == "" && fol.refuted == "" && fol.aside != ""
+		if asideOnly && ln.Kind == KindEcho {
+			ln.Kind, ln.Why, ln.Echo = KindUnaccounted, fol.aside+"; but the call's recorded answer holds it, an echo keploy cannot answer beside a source it set aside", nil
+		}
 		// A time of day whole (textTimeOfDay), which names no day, is a
 		// read modulo a day (textTodRead), checked so at every replay.
-		if ln.Kind == KindNoise && dc.ofIn(r.Value, l.Value, w, at).clock.whole {
+		//
+		// One instant whole that names its moment, made before its call's
+		// window (in keploy test the lead shows a read made no later than
+		// its call in a cutoff made minutes before its window, createdAt >=
+		// now - 2m), is tried as an offset below zero first, as
+		// classifyInstant tries a typed one: where its window shows it
+		// before every read in it in both runs at one offset, and the
+		// offset rule learns it (textClockOffset), that offset, checked at
+		// every replay in its call's span; only otherwise the plain read,
+		// as before. A value its window holds shows no offset.
+		if v := dc.ofIn(r.Value, l.Value, w, at); ln.Kind == KindNoise && v.clock.whole {
+			if off, ok := dc.textClockOffset(r, l, v, w, resp); ok {
+				return off
+			}
 			ln.Read = textClockRead(r.Value, l.Value)
 			if ln.Read == nil {
 				ln.Read = dc.textTodRead(r.Value, l.Value, w, at)
@@ -1281,6 +1322,65 @@ func classifyRead(dc *DriftCache, drift []string, live, rec Shape, at time.Time,
 				ln.Read.Zone = dc.textReadZone(r.Value, l.Value, w, at)
 			}
 			ln.Kind, ln.Why = KindClockRead, clockReadUncheckedWhy
+		}
+		// A value left noise, which no replay checks, whose source search
+		// went past a leaf only (asideOnly): noise only where the recording
+		// and F gave the application its candidate sources in the same
+		// order, named so (follows.followed); refused otherwise. A read of
+		// the clock (KindClockRead) is checked against its call's clock at
+		// every replay, which no order of its sources changes.
+		if asideOnly && ln.Kind == KindNoise {
+			if ln = fol.followed(ln, at, served, all); ln.Kind == KindNoise {
+				ln.Why = fol.aside + ", and keploy learns it as varying"
+			}
+		}
+		return ln
+	}
+	for _, p := range drift {
+		r, l := rec.Leaves[p], live.Leaves[p]
+		ln := leaf(r, l, w, false)
+		// A read made before its call's window: in keploy mock's client
+		// tests (the only calls whose window knows each run's test begin),
+		// a value refused in its call's window is classified again in the
+		// window from each run's test begin to the call (Window.sinceBegin:
+		// an application that reads its clock once for a request and writes
+		// it at a later call). Only a plain read of the clock it learns
+		// there is taken (one instant whole in both runs, or a typed one),
+		// checked at every replay from its test's begin
+		// (models.SinceTestBegin); anything else it learns there (noise, a
+		// variable, an echo, a read plus an offset) is not, and the refusal
+		// stands: the wider window turns a refusal into a checked read,
+		// never into noise.
+		if wb := w.sinceBegin(); ln.Kind == KindUnaccounted && wb != nil {
+			if early := leaf(r, l, wb, false); early.Kind == KindClockRead && early.Read != nil {
+				early.Read.Since = models.SinceTestBegin
+				ln = early
+			}
+		}
+		// A copy of an earlier read of the clock that is a read in its own
+		// call's window too: under the rule a copy follows its source
+		// (follow), in keploy mock's client tests (the only calls whose
+		// window knows each run's test begin), a value learned as a
+		// variable of an earlier place (a copy of what the test's earlier
+		// call sent, which held it in both runs) that, read as a value no
+		// earlier place is the source of, is a plain read of the clock its
+		// call's window holds in both runs, is learned as a read of the
+		// clock since its test began (models.SinceTestBegin), never as the
+		// variable. Both explanations hold in the rounds, and that read
+		// holds under both: the earlier place's read was made after the
+		// test began too. Learned as a variable, a full round that made the
+		// two reads in one second would bind the value to the earlier
+		// place, and one that made them a second apart would learn a read,
+		// so a replay whose reads land a second apart would miss, or not,
+		// by the full round's timing. A copy its own window does not hold
+		// stays the variable (the copy alone explains it), and so does
+		// anything else learned as a value with no source (noise, an echo,
+		// a read plus an offset, a refusal).
+		if wb := w.sinceBegin(); follow && ln.Kind == KindVariable && wb != nil {
+			if own := leaf(r, l, w, true); own.Kind == KindClockRead && own.Read != nil {
+				own.Read.Since = models.SinceTestBegin
+				ln = own
+			}
 		}
 		out = append(out, ln)
 	}
@@ -2256,6 +2356,9 @@ func appeared(dc *DriftCache, recorded, now string, at time.Time, served []Earli
 // followed). A place F did not serve, or served changed, or whose payload
 // holds the value F saw too, stays where the value came from. A leaf F
 // served as recorded (Seen.Live) is no place either way: it did not drift.
+// A leaf that held the recorded value whole is the value's source only where
+// it held the value F saw too: one F saw hold another value is set aside the
+// same way, and named so (follows.refuteSeen).
 func appearedIn(dc *DriftCache, v *valueDrift, at time.Time, served []Earlier, raw []Raw, fol *follows) (Place, bool) {
 	recorded := v.rec
 	// The place is where the value was sent whole, not where it was answered
@@ -2281,7 +2384,7 @@ func appearedIn(dc *DriftCache, v *valueDrift, at time.Time, served []Earlier, r
 			} else {
 				ok, whole = sources(dc.of(s.Leaf.Value, s.Live), v)
 			}
-			if !ok {
+			if !ok || fol.refuteSeen(e, s, whole, v) {
 				continue
 			}
 			if r := placeRank(e, s, whole); r < rank {
@@ -2359,7 +2462,7 @@ func appearedIn(dc *DriftCache, v *valueDrift, at time.Time, served []Earlier, r
 		}
 		atCall := x.at.Equal(at)
 		if from, ok := dc.echoRaw(x, echoed); ok {
-			from.AtCall, from.noTime = atCall, x.noTime
+			from.AtCall, from.noTime, from.unserved = atCall, x.noTime, !x.served
 			from.startUp = x.swapHolds(x.text, raw, func(own string) bool { return dc.holdsRecorded(own, echoed) })
 			return from, true
 		}
@@ -2377,17 +2480,17 @@ func appearedIn(dc *DriftCache, v *valueDrift, at time.Time, served []Earlier, r
 			for _, text := range texts {
 				if containsWholeClock(text, recorded) {
 					swap := x.swapHolds(text, raw, func(own string) bool { return containsWholeClock(own, recorded) })
-					return Place{Mock: x.mock, Field: dc.fieldOf(x, texts, recorded), Held: recorded, AtCall: atCall, noTime: x.noTime, startUp: swap}, true
+					return Place{Mock: x.mock, Field: dc.fieldOf(x, texts, recorded), Held: recorded, AtCall: atCall, noTime: x.noTime, unserved: !x.served, startUp: swap}, true
 				}
 				if v.decoded && containsWholeClock(text, v.decRec) {
 					swap := x.swapHolds(text, raw, func(own string) bool { return containsWholeClock(own, v.decRec) })
-					return Place{Mock: x.mock, Field: dc.fieldOf(x, texts, v.decRec), Held: v.decRec, AtCall: atCall, noTime: x.noTime, startUp: swap}, true
+					return Place{Mock: x.mock, Field: dc.fieldOf(x, texts, v.decRec), Held: v.decRec, AtCall: atCall, noTime: x.noTime, unserved: !x.served, startUp: swap}, true
 				}
 			}
 		}
 		for _, w := range searched {
 			if ContainsToken(texts[0], w) || ContainsToken(texts[1], w) {
-				p := Place{Mock: x.mock, Field: dc.fieldOf(x, texts, w), Held: w, AtCall: atCall, noTime: x.noTime}
+				p := Place{Mock: x.mock, Field: dc.fieldOf(x, texts, w), Held: w, AtCall: atCall, noTime: x.noTime, unserved: !x.served}
 				p.startUp = x.swapHolds(texts[0], raw, func(own string) bool { return holdsToken(own, w) })
 				// A word of a connection's start-up a swap can change is
 				// never set aside as a source the value moved away from: F
@@ -2529,7 +2632,7 @@ func evidence(v *valueDrift, from Place) string {
 	if provenance == "" {
 		provenance = notClock(v)
 	}
-	return found + "; " + provenance + ", so keploy follows it as a value from there. " + correction(from.Mock)
+	return found + "; " + provenance + ", so keploy follows it as a value from there. " + correction(from.Mock, from.unserved)
 }
 
 // startUpWhy is why a drifted value v whose recorded value, or a part of
@@ -2587,9 +2690,17 @@ func notClock(v *valueDrift) string {
 	return "nothing shows the value is a read of the application's clock (it did not move by the lead that record's full round runs ahead of the recording, and no window of its call shows a read)"
 }
 
-// correction is how to correct a refusal of a value found in mock.
-func correction(mock string) string {
-	return "If the field is a time the application reads from its own clock, declare it noise in keploy.yml, and keploy stops comparing it; otherwise it flowed from " + mock + ", where keploy cannot follow it yet"
+// correction is how to correct a refusal of a value found in mock. Where
+// record's full round never served mock before the call (unserved:
+// Raw.Served false, Place.unserved), the reason says so, rather than that
+// keploy cannot follow the value there yet: that round gave the application
+// nothing from there.
+func correction(mock string, unserved bool) string {
+	head := "If the field is a time the application reads from its own clock, declare it noise in keploy.yml, and keploy stops comparing it; otherwise it flowed from " + mock
+	if unserved {
+		return head + ", its source recording, which record's full round never served before this call (its own call missed earlier, was answered from another recording, or was not made)"
+	}
+	return head + ", where keploy cannot follow it yet"
 }
 
 // partOf names where part stands in value, by its characters' places,

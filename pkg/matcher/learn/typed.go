@@ -476,7 +476,7 @@ func instantUnread(r, l Leaf) string {
 // its words. unread says why the test case's own request could not be read
 // (requestUnread; "" when it was, or no test case's request applies): then
 // the echo could not read it, and the instant is never noise or an echo.
-func (dc *DriftCache) classifyInstant(r, l Leaf, at time.Time, served []Earlier, raw []Raw, resp []Leaf, w *Window, unread string, places func() *offsetPlaces) Learned {
+func (dc *DriftCache) classifyInstant(r, l Leaf, at time.Time, served []Earlier, raw []Raw, resp []Leaf, w *Window, unread string, places func() *offsetPlaces, noSource bool) Learned {
 	ln := Learned{Kind: KindNoise, Recorded: r, Live: l}
 	rt, okR := readTyped(r)
 	lt, okL := readTyped(l)
@@ -485,7 +485,13 @@ func (dc *DriftCache) classifyInstant(r, l Leaf, at time.Time, served []Earlier,
 		return ln
 	}
 	rec, live := rt.moment(rt.res), lt.moment(lt.res)
-	if from, ok := dc.instantServedFrom(r, rec, live, served); ok {
+	// noSource: read as an instant no earlier place is the source of (no
+	// variable's search of the places that held the moment it was recorded
+	// with), every other rule as it stands (classifyRead's copy of a read its
+	// own window holds). The echo of a pick still reads it: a moment F saw
+	// that an earlier place holds, with the recorded one held nowhere, is no
+	// copy the recording shows.
+	if from, ok := dc.instantServedFrom(r, rec, live, served); ok && !noSource {
 		ln.Kind, ln.From = KindVariable, from
 		return ln
 	}
@@ -502,11 +508,11 @@ func (dc *DriftCache) classifyInstant(r, l Leaf, at time.Time, served []Earlier,
 		ln.Kind, ln.Why = KindUnaccounted, pickUnaccounted(where)
 		return ln
 	}
-	if from, ok := dc.instantLeafFrom(r, rec, served); ok {
+	if from, ok := dc.instantLeafFrom(r, rec, served); ok && !noSource {
 		ln.Kind, ln.From, ln.Why = KindVariable, from, instantEvidence(from)
 		return ln
 	}
-	if from, ok := dc.instantRawFrom(r, rec, at, raw); ok {
+	if from, ok := dc.instantRawFrom(r, rec, at, raw); ok && !noSource {
 		ln.Kind, ln.From, ln.Why = KindVariable, from, instantEvidence(from)
 		return ln
 	}
@@ -536,15 +542,39 @@ func (dc *DriftCache) classifyInstant(r, l Leaf, at time.Time, served []Earlier,
 	// checks no read of the clock refuses it with that reason still
 	// (KindClockRead). "" for any other.
 	noWindow := ""
+	// A read of the clock plus a constant offset (a time to live, a due
+	// date; a cutoff below zero, createdAt >= now - 2m), in its call's
+	// window in both runs: compared, never noise, and tried first, before
+	// any plain read of the clock. A value its window holds shows no offset
+	// (clockOffsetOf), nor does one of a call with no window. In keploy
+	// test, the lead shows a read made no later than its call in a cutoff
+	// made minutes before its window as it shows one made in it: such a
+	// value is the offset its window shows where the offset rule learns
+	// one, and only otherwise the plain read the lead shows, as before. In
+	// keploy mock's client tests too: a value the harness gives the
+	// application is compared all the same (the replay checks the offset,
+	// never lets it pass), and one built on a read made before its call's
+	// window shows no offset coarser than a second (clockOffset refuses
+	// it), as a read the application made earlier stands from the window by
+	// how long ago it was made.
+	off, offset := clockOffsetOf(rt, lt, w)
+	var tried Learned
+	if offset {
+		if tried = dc.clockOffset(ln, off, max(rt.res, lt.res), lt.at.Sub(rt.at), w, unread, rec, resp); tried.Kind == KindClockOffset {
+			return tried
+		}
+	}
 	if !instantClock(rt, lt, w, !dc.clientTests, at, dc.zone) {
-		// A read of the clock plus a constant offset (a time to live, a
-		// due date), in its call's window in both runs: compared, never
-		// noise.
-		// Not in a client test: keploy mock's harness gives the
-		// application inputs keploy does not see, which may be such a
-		// value too (clientTestWhy says so).
-		if off, ok := clockOffsetOf(rt, lt, w); ok && !dc.clientTests {
-			return dc.clockOffset(ln, off, max(rt.res, lt.res), lt.at.Sub(rt.at), w, unread, rec, resp)
+		// Where the offset rule refuses an offset neither the lead nor a
+		// window shows a plain read beside, the client test's own refusal
+		// stands (clientTestWhy), which says how to correct a value the
+		// harness supplies; so does an offset below zero's everywhere: a
+		// value before its call's window is refused with the reason it was
+		// before keploy learned one (a read made earlier stands from the
+		// window by how long ago it was made). keploy test refuses an offset
+		// above zero naming it.
+		if offset && !dc.clientTests && off.Min > 0 {
+			return tried
 		}
 		why := instantNotClock
 		switch {
@@ -662,9 +692,14 @@ func (dc *DriftCache) noWindowRead(r, l typedInstant, w *Window, at time.Time) b
 // models.ClockOffset.CutCoarserThan): it only ever refuses more, as a
 // replay reads its value at its own resolution. ok only where one offset
 // does both: a constant offset from the clock, which a value built on a
-// served instant or a constant shows in neither run's window. Only a value
-// later than its call in both runs (each least offset above none) shows
-// one. Only an instant that names its moment (InstantLeaf) shows one: a
+// served instant or a constant shows in neither run's window. The offset is
+// signed (models.ClockOffset's signed): a value later than every read in
+// its window in both runs (each least offset above zero: an expiry) shows
+// one above zero, and one whose cut ends before every read in its window in
+// both runs (each bound, which it excludes, at or below zero: a cutoff the
+// application queries from, createdAt >= now - 2m) one below; a value
+// inside a run's window (a plain read's offsets lie around zero), or after
+// it in one run and before it in the other, shows none. Only an instant that names its moment (InstantLeaf) shows one: a
 // wall clock of no zone (a date too) stands from the clock by its zone's
 // offset as much as by one the application adds, which keploy cannot tell
 // apart, and a time of day names no day. One of two forms, outside the
@@ -697,11 +732,17 @@ func clockOffsetOf(r, l typedInstant, w *Window) (models.ClockOffset, bool) {
 	if !ok {
 		return models.ClockOffset{}, false
 	}
-	// Later than its call in both runs, as no read of the clock is: a read
-	// made before its window (before the previous call) stands from the
-	// window by how long ago it was made, which the runs' timing sets, not
-	// by an offset, and is refused as before.
-	if rlo <= 0 || llo <= 0 {
+	// On one side of its window, the same in both runs: later than every
+	// read in it (an expiry), or earlier (a cutoff). A read made before its
+	// window (before the previous call) stands from the window by how long
+	// ago it was made, which the runs' timing sets, so it shows one offset
+	// in both runs only where the two waited as long as each other to a
+	// few milliseconds, and the checks of clockOffset (a unit coarser than
+	// a second, one multiple of it in range) refuse it in all but a whole
+	// number of minutes; even then every replay compares that offset, so a
+	// read whose wait changed fails there, never passes unchecked.
+	later, earlier := rlo > 0 && llo > 0, rhi <= 0 && lhi <= 0
+	if !later && !earlier {
 		return models.ClockOffset{}, false
 	}
 	o := models.ClockOffset{Min: max(rlo, llo), Max: min(rhi, lhi), Res: max(r.res, l.res, grain), Layout: models.LayoutTyped}
@@ -806,6 +847,49 @@ func (dc *DriftCache) clockOffset(ln Learned, off models.ClockOffset, enc, gap t
 	return ln
 }
 
+// textClockOffset is classifyRead's reading, in keploy mock's client tests,
+// of a drifted text (r as recorded, l as record's full round saw it, v what
+// changed) that its call's window w holds as no plain read of the
+// application's clock (clientTestUnread), and, in any test, of one the lead
+// or a window shows a plain read of it, tried as an offset first (a value
+// made before its call's window: classifyRead): where each is one instant
+// whole that names its moment (readClockTextWall: an epoch's digits, a time
+// with its zone), both written in one layout, and w holds the two as a read of
+// each run's clock plus one constant offset (clockOffsetOf), that offset,
+// learned as classifyInstant learns a typed one (clockOffset: only for a
+// caller whose replay compares it, in a unit coarser than a second, and the
+// rest of its checks), in the text's layout, which a replay reads its value
+// in. ok is false where no offset is learned (the value is no such instant,
+// a wall clock of no zone, which stands from the clock by its zone's offset
+// as much as by one the application adds; the two runs wrote two layouts; w
+// shows no one offset; or clockOffset refuses it), and the client test's
+// refusal, or the plain read, stands, as the typed reading's does
+// (classifyInstant).
+func (dc *DriftCache) textClockOffset(r, l Leaf, v *valueDrift, w *Window, resp []Leaf) (Learned, bool) {
+	rat, rres, rwall, okR := readClockTextWall(r.Value)
+	lat, lres, lwall, okL := readClockTextWall(l.Value)
+	if !okR || !okL || rwall || lwall {
+		return Learned{}, false
+	}
+	lay := models.ClockOffset{Layout: clockTextLayout(r.Value)}.MeetLayout(clockTextLayout(l.Value))
+	if lay == "" || lay == models.LayoutApart {
+		return Learned{}, false
+	}
+	off, ok := clockOffsetOf(typedInstant{at: rat, res: rres, names: namesMoment}, typedInstant{at: lat, res: lres, names: namesMoment}, w)
+	if !ok {
+		return Learned{}, false
+	}
+	// The recorded moment the echo check reads the call's answer for.
+	for _, p := range v.instants {
+		if p.rec.key.at == rat.UnixNano() {
+			off.Layout = lay
+			got := dc.clockOffset(Learned{Kind: KindNoise, Recorded: r, Live: l}, off, max(rres, lres), lat.Sub(rat), w, "", p.rec, resp)
+			return got, got.Kind == KindClockOffset
+		}
+	}
+	return Learned{}, false
+}
+
 // fieldName is the leaf's name as keploy.yml's noise writes it (Leaf.Noise:
 // "body.expiresAt", not its encoding's "...expiresAt.$date.$numberLong"),
 // its path where it has none.
@@ -814,6 +898,20 @@ func fieldName(l Leaf) string {
 		return l.Noise
 	}
 	return l.Path
+}
+
+// offsetNamed is what the offset off is to the application, as a reason
+// names it: a time to live (a due date, an expiry) where it is above zero,
+// a look-back (a cutoff such as createdAt >= now - 2m) where it is below,
+// an offset where its range holds both.
+func offsetNamed(off models.ClockOffset) string {
+	switch {
+	case off.Min > 0:
+		return "a time to live"
+	case off.Max < 0:
+		return "a look-back"
+	}
+	return "an offset"
 }
 
 // clockOffsetSeen is what the learn step saw of a value at off from the
@@ -825,7 +923,7 @@ func clockOffsetSeen(path string, off models.ClockOffset) string {
 // clockOffsetEvidence is a KindClockOffset's Why: what was seen, and how the
 // replay compares it.
 func clockOffsetEvidence(path string, off models.ClockOffset) string {
-	return clockOffsetSeen(path, off) + ". A replay compares the offset: a time to live changed by " + aUnit(off.Unit()) + " or more still fails; if the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
+	return clockOffsetSeen(path, off) + ". A replay compares the offset: " + offsetNamed(off) + " changed by " + aUnit(off.Unit()) + " or more still fails; if the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
 }
 
 // clockOffsetFineWhy is why an instant at the clock plus an offset off is
@@ -833,7 +931,7 @@ func clockOffsetEvidence(path string, off models.ClockOffset) string {
 // changed, and ": an application that cuts its value to that unit (a whole
 // second) makes a time to live changed by one look the same.
 func clockOffsetFineWhy(path string, off models.ClockOffset) string {
-	return clockOffsetSeen(path, off) + ", but the offset reads in " + unitWord(off.Unit()) + "s, and an application that cuts its value to the " + unitWord(off.Unit()) + " makes a time to live changed by " + aUnit(off.Unit()) + " look the same, so keploy refuses an offset that reads in a second or finer. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
+	return clockOffsetSeen(path, off) + ", but the offset reads in " + unitWord(off.Unit()) + "s, and an application that cuts its value to the " + unitWord(off.Unit()) + " makes " + offsetNamed(off) + " changed by " + aUnit(off.Unit()) + " look the same, so keploy refuses an offset that reads in a second or finer. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
 }
 
 // clockOffsetCutWhy is why an instant at the clock plus an offset off is
@@ -875,7 +973,7 @@ func apartByUnits(gap, enc time.Duration) bool {
 // recorded one, is above zero for any offset both runs show.
 func clockOffsetApartWhy(path string, off models.ClockOffset, gap, enc time.Duration) string {
 	u := unitWord(models.UnitAbove(enc))
-	return clockOffsetSeen(path, off) + ", but its two values stand " + models.ShortDuration(gap) + " apart, a whole number of " + u + "s, the unit above the " + models.ShortDuration(enc) + " their encoding writes: an application that cuts its value to the " + u + " and adds a time to live that is no whole number of " + u + "s shows that, and a replay could then hold a time to live changed by " + aUnit(off.Unit()) + ", so keploy refuses it. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
+	return clockOffsetSeen(path, off) + ", but its two values stand " + models.ShortDuration(gap) + " apart, a whole number of " + u + "s, the unit above the " + models.ShortDuration(enc) + " their encoding writes: an application that cuts its value to the " + u + " and offsets it by " + offsetNamed(off) + " that is no whole number of " + u + "s shows that, and a replay could then hold " + offsetNamed(off) + " changed by " + aUnit(off.Unit()) + ", so keploy refuses it. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
 }
 
 // clockOffsetWideWhy is why an instant at the clock plus an offset in off is
@@ -884,7 +982,7 @@ func clockOffsetApartWhy(path string, off models.ClockOffset, gap, enc time.Dura
 // its call's windows, or the cut both runs' values share, bound the offset
 // too loosely for a replay to tell a time to live changed by that unit.
 func clockOffsetWideWhy(path string, off models.ClockOffset, enc time.Duration) string {
-	return path + " = " + off.Range() + " at a resolution of " + resolutionOf(off.Res, enc) + ": in the recording and in record's full round alike, it is a read of the application's clock in its call's window plus an offset in that range, but the range and the resolution are not narrower than the " + unitWord(off.Unit()) + " the offset reads in, so a replay could not tell a time to live changed by " + aUnit(off.Unit()) + " from it, and keploy refuses it. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
+	return path + " = " + off.Range() + " at a resolution of " + resolutionOf(off.Res, enc) + ": in the recording and in record's full round alike, it is a read of the application's clock in its call's window plus an offset in that range, but the range and the resolution are not narrower than the " + unitWord(off.Unit()) + " the offset reads in, so a replay could not tell " + offsetNamed(off) + " changed by " + aUnit(off.Unit()) + " from it, and keploy refuses it. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
 }
 
 // resolutionOf is res as a reason reads it, saying what set it: the
@@ -929,7 +1027,7 @@ func unitWord(u time.Duration) string {
 // whose replay does not compare an offset (Window.ComparesOffsets), read
 // after "<field> changed, and ".
 func clockOffsetUncomparedWhy(path string, off models.ClockOffset) string {
-	return clockOffsetSeen(path, off) + ", and this protocol's replay does not compare such an offset yet: as noise, a changed time to live would pass, so keploy refuses it. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
+	return clockOffsetSeen(path, off) + ", and this protocol's replay does not compare such an offset yet: as noise, " + offsetNamed(off) + " changed by any amount would pass, so keploy refuses it. If the field is a time the application reads from its own clock with no rule, declare it noise in keploy.yml, and keploy stops comparing it"
 }
 
 // clockOffsetEchoedWhy is why such an instant is refused where the call's
@@ -1103,6 +1201,7 @@ func (dc *DriftCache) instantEchoFrom(r Leaf, echoed []echoMatch, at time.Time, 
 			continue
 		}
 		if from, ok := dc.echoRaw(x, echoed); ok {
+			from.unserved = !x.served
 			return from, true
 		}
 	}
@@ -1165,7 +1264,7 @@ func (dc *DriftCache) instantRawFrom(r Leaf, rec moment, at time.Time, raw []Raw
 				break
 			}
 		}
-		return Place{Mock: x.mock, Field: field, Held: r.Value}, true
+		return Place{Mock: x.mock, Field: field, Held: r.Value, unserved: !x.served}, true
 	}
 	return Place{}, false
 }
@@ -1211,7 +1310,7 @@ func (dc *DriftCache) holdsExact(text string, m moment) bool {
 func instantEvidence(from Place) string {
 	at := placeAt(from)
 	if from.Echo {
-		return echoFound(at) + "; " + echoProvenance + ", so keploy follows it as a value from there. " + correction(from.Mock)
+		return echoFound(at) + "; " + echoProvenance + ", so keploy follows it as a value from there. " + correction(from.Mock, from.unserved)
 	}
-	return "the moment it was recorded with stands in " + at + ", as an instant of its own; an instant equal to one an earlier place holds is followed as a value from there, whether or not it is a read of the clock. " + correction(from.Mock)
+	return "the moment it was recorded with stands in " + at + ", as an instant of its own; an instant equal to one an earlier place holds is followed as a value from there, whether or not it is a read of the clock. " + correction(from.Mock, from.unserved)
 }

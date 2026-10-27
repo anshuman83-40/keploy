@@ -1265,7 +1265,7 @@ func TestAnInstantAtTheClockPlusAnOffsetIsLearnedAsThatOffset(t *testing.T) {
 	if ln.Kind != KindUnaccounted || ln.Offset != nil || ln.Why != clockOffsetUncomparedWhy(p, want) {
 		t.Errorf("not compared: %s (%s); want refused: %s", ln.Kind, ln.Why, clockOffsetUncomparedWhy(p, want))
 	}
-	if !strings.Contains(ln.Why, "clock + 30m") || !strings.Contains(ln.Why, "a changed time to live would pass") {
+	if !strings.Contains(ln.Why, "clock + 30m") || !strings.Contains(ln.Why, "a time to live changed by any amount would pass") {
 		t.Errorf("not compared: %q names neither the offset nor why it is refused", ln.Why)
 	}
 
@@ -1452,13 +1452,19 @@ func TestAClockOffsetNeedsClockYearsAWindowAndAResolution(t *testing.T) {
 // S5 of the offset rule's review: in a client test (keploy mock's harness
 // gives the application inputs keploy does not see) a value at the clock
 // plus an offset keeps the client test's reason, never an offset's.
-func TestAClientTestsClockOffsetKeepsItsReason(t *testing.T) {
+func TestAClientTestsClockOffsetIsLearnedAsInAnyTest(t *testing.T) {
 	const p = "body.expiresAt"
 	c := newClockOffsetCall()
 	ms := time.Millisecond
-	ln := classifyZoned(nil, true, p, InstantLeaf(p, p, c.read.Add(30*time.Minute).Truncate(ms), ms), InstantLeaf(p, p, c.fread.Add(30*time.Minute).Truncate(ms), ms), c.call, c.w.ComparesOffsets())
-	if ln.Kind != KindUnaccounted || ln.Offset != nil || ln.Why != clientTestWhy("", true) {
-		t.Errorf("a client test: %s %+v (%s); want refused: %s", ln.Kind, ln.Offset, ln.Why, clientTestWhy("", true))
+	rec, live := InstantLeaf(p, p, c.read.Add(30*time.Minute).Truncate(ms), ms), InstantLeaf(p, p, c.fread.Add(30*time.Minute).Truncate(ms), ms)
+	ln := classifyZoned(nil, true, p, rec, live, c.call, c.w.ComparesOffsets())
+	want := classifyZoned(nil, false, p, rec, live, c.call, c.w.ComparesOffsets())
+	if ln.Kind != KindClockOffset || ln.Offset == nil || want.Offset == nil || *ln.Offset != *want.Offset || ln.Why != want.Why {
+		t.Errorf("a client test: %s %+v (%s); want as in any test: %s %+v (%s)", ln.Kind, ln.Offset, ln.Why, want.Kind, want.Offset, want.Why)
+	}
+	// Not compared at replay: refused, the client test's reason standing.
+	if ln := classifyZoned(nil, true, p, rec, live, c.call, c.w); ln.Kind != KindUnaccounted || ln.Why != clientTestWhy("", true) {
+		t.Errorf("a client test, not compared: %s (%s); want refused: %s", ln.Kind, ln.Why, clientTestWhy("", true))
 	}
 }
 

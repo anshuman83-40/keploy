@@ -125,7 +125,8 @@ func (r ClockRead) inOneSecond(o ClockRead) bool {
 
 // ClockOffset is how far a value stands from a read of the application's
 // clock: a value the application builds on its clock by a constant offset
-// (an expiry it sets thirty minutes after now), which the learn step found,
+// (an expiry it sets thirty minutes after now, or a cutoff it queries from
+// two minutes before now), which the learn step found,
 // in its call's window both in the recording and in record's full round, at
 // a read of that run's clock plus one offset from Min up to, not including,
 // Max (learn.KindClockOffset). A replay keeps comparing it: the value it
@@ -134,8 +135,12 @@ func (r ClockRead) inOneSecond(o ClockRead) bool {
 // and Max are what the two runs' windows bound the offset to, never a
 // tolerance, and the learn step learns one only where they, with Res, are
 // narrower than the unit the offset reads in (Unit, Within): thirty minutes
-// bounded to a few milliseconds, never to a few minutes. Min is above zero
-// and Unit coarser than a second for any offset the learn step finds.
+// bounded to a few milliseconds, never to a few minutes. The offset is
+// signed and never zero (signed): above zero for a value the application
+// builds after its read (Min above zero: an expiry), below zero for one it
+// builds before it (Max below zero: createdAt >= now - 2m), never a range
+// around zero, which is a plain read's (Plain: Min and Max both zero); and
+// Unit is coarser than a second for any offset the learn step finds.
 //
 // Res is the resolution the learn step read the value at: of an offset, the
 // coarser of the one its encoding writes and the granularity both runs'
@@ -216,6 +221,15 @@ type ClockOffset struct {
 	Res    time.Duration `json:"res" yaml:"res" bson:"res"`
 	Zone   string        `json:"zone,omitempty" yaml:"zone,omitempty" bson:"zone,omitempty"`
 	Layout string        `json:"layout,omitempty" yaml:"layout,omitempty" bson:"layout,omitempty"`
+	// Since is where a replay's span for the read starts: "" at its call's
+	// window (after the previous data-plane call); SinceTestBegin at the
+	// running test's begin, for a read the learn step saw made before its
+	// call's window in both runs and after the test began (keploy mock's
+	// client tests: an application that reads its clock once for a request
+	// and writes it at a later call). A replay that cannot tell where the
+	// running test began on the application's clock refuses such a read, and
+	// one of a Since this keploy does not read holds nothing (SinceKnown).
+	Since string `json:"since,omitempty" yaml:"since,omitempty" bson:"since,omitempty"`
 }
 
 // The layouts a ClockOffset's Layout names beside those of a text or a
@@ -328,6 +342,30 @@ const (
 	// holds (Meet); it holds nothing.
 	ZoneApart = "apart"
 )
+
+// SinceTestBegin is a ClockOffset's Since for a read checked from the
+// running test's begin rather than from its call's window (ClockOffset).
+const SinceTestBegin = "test"
+
+// SinceKnown reports whether o's Since is one a replay reads: "" (its call's
+// window) or SinceTestBegin. A replay refuses a value at a place of any
+// other, from whatever keploy wrote it, rather than check it in a span its
+// learn step did not read.
+func (o ClockOffset) SinceKnown() bool { return o.Since == "" || o.Since == SinceTestBegin }
+
+// meetSince is the Since a replay reads a place from that two learnings read
+// from a and b: SinceTestBegin where either did (a span from the test's
+// begin holds every read its call's window does), and one this keploy does
+// not read where either is (SinceKnown fails it closed).
+func meetSince(a, b string) string {
+	switch {
+	case a == b || b == "":
+		return a
+	case a == "" || a == SinceTestBegin:
+		return b
+	}
+	return a
+}
 
 // ZoneKnown reports whether o's Zone is one a replay reads a value in: ""
 // (as the value names its moment), ZoneUTC, ZoneApp or ZoneEither. Holds
@@ -463,10 +501,11 @@ func (o ClockOffset) Within(spans ...time.Duration) bool {
 // the application's zone, passing the value where either holds. A window with no start (a zero to
 // is before any from), one that ends before it starts, a res of none or an
 // empty o (it has no Unit) holds nothing, and so does an o the learn step
-// never finds (a Min of zero or below, a Max not above Min, or a Res of
-// none or below: one built without the resolution it was learned at could
-// have its sums read finer than the application cuts its value), whose
-// width could overflow or whose Unit could swallow the sign of the offset.
+// never finds (offsets not all on one side of zero, signed: a range around
+// zero, whose width could overflow or whose Unit could swallow the sign of
+// the offset; or a Res of none or below: one built without the resolution
+// it was learned at could have its sums read finer than the application
+// cuts its value).
 func (o ClockOffset) Holds(at time.Time, res time.Duration, from, to time.Time) bool {
 	if !o.ZoneKnown() || !o.LayoutKnown() {
 		return false
@@ -474,7 +513,7 @@ func (o ClockOffset) Holds(at time.Time, res time.Duration, from, to time.Time) 
 	if o.Plain() {
 		return o.holdsRead(at, res, from, to)
 	}
-	if o.Min <= 0 || o.Max <= o.Min || o.Res <= 0 || o.Unit() <= time.Second || from.IsZero() || to.Before(from) || res <= 0 || o.CutCoarserThan(res) {
+	if !o.signed() || o.Res <= 0 || o.Unit() <= time.Second || from.IsZero() || to.Before(from) || res <= 0 || o.CutCoarserThan(res) {
 		return false
 	}
 	if !o.Within(to.Sub(from), o.Max-o.Min, max(res, o.Res)) {
@@ -486,8 +525,19 @@ func (o ClockOffset) Holds(at time.Time, res time.Duration, from, to time.Time) 
 // Plain reports whether o is a zero offset: a plain read of the
 // application's clock (learn.Learned.Read), its Min and Max both zero, which
 // Holds reads as this call's own now. An o the learn step learned with an
-// offset (learn.KindClockOffset) has a Min above zero.
+// offset (learn.KindClockOffset) is signed.
 func (o ClockOffset) Plain() bool { return o.Min == 0 && o.Max == 0 }
+
+// signed reports whether o's offsets, from Min up to, not including, Max,
+// lie all on one side of zero: all above it (Min above zero: a value the
+// application builds after its read, an expiry) or all below it (Max below
+// zero: one it builds before its read, a cutoff it queries from), with Max
+// above Min. Every offset the learn step learns is (learn.KindClockOffset);
+// a range around zero is none, its Unit would swallow the offset's sign (a
+// day around zero holds any value), and Holds holds nothing for it.
+func (o ClockOffset) signed() bool {
+	return (o.Min > 0 || o.Max < 0) && o.Min < o.Max
+}
 
 // Meet is o and p, two learnings of one place's clock read, as one: the
 // offsets both hold (from the later Min up to the earlier Max: a Plain o
@@ -505,15 +555,17 @@ func (o ClockOffset) Plain() bool { return o.Min == 0 && o.Max == 0 }
 // recording paired many times keeps one answer whatever order its
 // pairings came in.
 func (o ClockOffset) Meet(p ClockOffset) ClockOffset {
-	return ClockOffset{Min: max(o.Min, p.Min), Max: min(o.Max, p.Max), Res: max(o.Res, p.Res), Zone: meetZones(o.Zone, p.Zone), Layout: meetLayouts(o.Layout, p.Layout)}
+	return ClockOffset{Min: max(o.Min, p.Min), Max: min(o.Max, p.Max), Res: max(o.Res, p.Res), Zone: meetZones(o.Zone, p.Zone), Layout: meetLayouts(o.Layout, p.Layout), Since: meetSince(o.Since, p.Since)}
 }
 
 // Empty reports whether o is the Meet of learnings of one place that share
-// no offset: a Min above zero and a Max not above it; or that read it in
+// no offset: a Max not above its Min, other than a Plain o's (a Plain and
+// an offset meet so, and so do two offsets apart, of one sign or of
+// two); or that read it in
 // zones no one zone holds (ZoneApart). Holds holds nothing for it, and String says
 // why.
 func (o ClockOffset) Empty() bool {
-	return o.Min > 0 && o.Max <= o.Min || o.Zone == ZoneApart || o.Layout == LayoutApart
+	return !o.Plain() && o.Max <= o.Min || o.Zone == ZoneApart || o.Layout == LayoutApart
 }
 
 // MergeClocks is a and b, two sets of the places a call's learn steps
@@ -561,8 +613,10 @@ func (o ClockOffset) holdsRead(at time.Time, res time.Duration, from, to time.Ti
 // String is o as a person reads it: "clock" for a Plain o; "clock + 30m",
 // the one multiple from Min
 // up to Max of its Unit, and the two bounds after it where they are more
-// than a nanosecond apart: "clock + 30m (from 29m59.998s to 30m0.001s)".
-// Where they hold more than one multiple, it names no offset: "clock plus an
+// than a nanosecond apart: "clock + 30m (from 29m59.998s to 30m0.001s)";
+// one below zero as "clock - 2m (from -2m0.04s to -1m59.989s)".
+// Where they hold more than one multiple, or lie around zero (no offset the
+// learn step finds: signed), it names no offset: "clock plus an
 // offset from 29m59.96s to 32m59.956s"; an Empty o says it holds none:
 // "clock reads no one offset holds (from 30m up to 0s)". A Zone of a wall
 // clock of no zone follows it: "clock, a wall clock of no zone in the
@@ -578,8 +632,14 @@ func (o ClockOffset) String() string {
 		return "clock reads in no one form (one place learned written in different layouts at different calls)"
 	case !o.LayoutKnown():
 		return "clock read written in a layout this keploy does not read (" + strconv.Quote(o.Layout) + ")"
+	case !o.SinceKnown():
+		return "clock read from a start this keploy does not read (" + strconv.Quote(o.Since) + ")"
 	}
-	return o.offsetString() + o.zoneString() + o.layoutString()
+	s := o.offsetString() + o.zoneString() + o.layoutString()
+	if o.Since == SinceTestBegin {
+		s += ", read after its test began and before its call"
+	}
+	return s
 }
 
 // layoutString is the form o's Layout says a replay's value is written in,
@@ -628,10 +688,13 @@ func (o ClockOffset) offsetString() string {
 		return "clock reads no one offset holds (from " + ShortDuration(o.Min) + " up to " + ShortDuration(o.Max) + ")"
 	}
 	u := o.Unit()
-	if u == 0 || ceilTo(o.Min, u)+u < o.Max {
+	if u == 0 || !o.signed() || ceilTo(o.Min, u)+u < o.Max {
 		return o.Range()
 	}
 	s := "clock + " + ShortDuration(ceilTo(o.Min, u))
+	if n := ceilTo(o.Min, u); n < 0 {
+		s = "clock - " + ShortDuration(-n)
+	}
 	if o.Max-o.Min > 1 {
 		s += " (from " + ShortDuration(o.Min) + " to " + ShortDuration(o.Max) + ")"
 	}

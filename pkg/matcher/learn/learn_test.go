@@ -331,15 +331,16 @@ func TestClassify(t *testing.T) {
 		t.Fatalf("body.file from %+v: a part of a longer value, found where it drifted together", f)
 	}
 	// A raw mock's place has no leaf: it names the mock, and what was found
-	// in which field of its payload.
+	// in which field of its payload; neither mock was served before the
+	// call (a reason says so: correction).
 	leafless := func(p Place) Place { p.Field, p.Held = "", ""; return p }
-	if leafless(from["body.sess"]) != (Place{Mock: "redis-2"}) || leafless(from["body.seq"]) != (Place{Mock: "pg-3"}) {
+	if leafless(from["body.sess"]) != (Place{Mock: "redis-2", unserved: true}) || leafless(from["body.seq"]) != (Place{Mock: "pg-3", unserved: true}) {
 		t.Fatalf("body.sess from %+v, body.seq from %+v", from["body.sess"], from["body.seq"])
 	}
 	if f := from["body.sess"]; f.Field != "spec.genericrequests[0].message[0].data" || f.Held != "71a" {
 		t.Fatalf("body.sess from %+v: want its word 71a found in spec.genericrequests[0].message[0].data", f)
 	}
-	if leafless(from["body.db"]) != (Place{Mock: "pg-3"}) {
+	if leafless(from["body.db"]) != (Place{Mock: "pg-3", unserved: true}) {
 		t.Fatalf("body.db from %+v: a raw mock's place has no leaf", from["body.db"])
 	}
 }
@@ -738,6 +739,38 @@ func TestClockOf(t *testing.T) {
 		// ClockOf is that evidence, for an adapter.
 		if ClockOf(tc.rec, tc.live) != tc.whole {
 			t.Errorf("%s: ClockOf %v, want %v", tc.name, !tc.whole, tc.whole)
+		}
+	}
+	// ClockWordsOf names the changed words of a read the lead moved, whole
+	// or beside words that changed otherwise, in the order they stand,
+	// recorded first; none where no changed word is one. Many changed words
+	// around the read do not hide it.
+	sec, fsec := strconv.FormatInt(at.Unix(), 10), strconv.FormatInt(f.Unix(), 10)
+	many := func(n, base int) string {
+		var b strings.Builder
+		for i := 0; i < n; i++ {
+			b.WriteString(strconv.Itoa(base+i) + "x ")
+		}
+		return b.String()
+	}
+	for _, tc := range []struct {
+		name      string
+		rec, live string
+		want      []string
+	}{
+		{"epoch seconds whole", sec, fsec, []string{sec, fsec}},
+		{"an event id: the read beside a random suffix", "evt_" + sec + "_a1b2", "evt_" + fsec + "_c3d4", []string{sec, fsec}},
+		{"RFC 3339, its unchanged words left out", at.Format(time.RFC3339), f.Format(time.RFC3339), []string{"14T23", "59", "41Z", "15T00", "00", "42Z"}},
+		{"a UUID v7: its time groups only", uuid7(at, "abc123456789abcdef"), uuid7(f, "def0123456789abcde"), clockWordsOfUUID7(at, f)},
+		{"the read after forty changed words", many(40, 100) + sec, many(40, 500) + fsec, []string{sec, fsec}},
+		{"a counter", "41", "42", nil},
+		{"moved by another amount", at.Format(time.RFC3339), at.Add(2 * time.Minute).Format(time.RFC3339), nil},
+		{"a random suffix alone", "evt_" + sec + "_a1b2", "evt_" + sec + "_c3d4", nil},
+		{"no word changed", "a-b", "a_b", nil},
+		{"one read written twice", sec + "/" + sec, fsec + "/" + fsec, []string{sec, sec, fsec, fsec}},
+	} {
+		if got := ClockWordsOf(tc.rec, tc.live); strings.Join(got, "|") != strings.Join(tc.want, "|") {
+			t.Errorf("ClockWordsOf %s: %q, want %q (%q→%q)", tc.name, got, tc.want, tc.rec, tc.live)
 		}
 	}
 	// A UUID v7's time groups moved with the clock; its random ones did not.
@@ -1755,4 +1788,20 @@ func TestAReasonIsOneTextAtEveryPlace(t *testing.T) {
 			t.Errorf("%s: %d outcomes for one input: %v", tc.name, len(seen), seen)
 		}
 	}
+}
+
+// clockWordsOfUUID7 is the time groups of uuid7(at, ...) then of uuid7(f,
+// ...) that differ: the words ClockWordsOf names for a UUID v7 the lead moved.
+func clockWordsOfUUID7(at, f time.Time) []string {
+	r := strings.Split(uuid7(at, "abc123456789abcdef"), "-")[:2]
+	l := strings.Split(uuid7(f, "def0123456789abcde"), "-")[:2]
+	var out []string
+	for _, side := range [][2][]string{{r, l}, {l, r}} {
+		for i, w := range side[0] {
+			if w != side[1][i] {
+				out = append(out, w)
+			}
+		}
+	}
+	return out
 }
