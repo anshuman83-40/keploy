@@ -547,9 +547,13 @@ func (dc *DriftCache) classifyInstant(r, l Leaf, at time.Time, served []Earlier,
 		// earlier stands from the window by how long ago it was made.
 		// There the offset rule only learns: where it refuses, the client
 		// test's own refusal stands (clientTestWhy), which says how to
-		// correct a value the harness supplies.
+		// correct a value the harness supplies. So does an offset below
+		// zero's everywhere: a value before its call's window is refused
+		// with the reason it was before keploy learned one (a read made
+		// earlier stands from the window by how long ago it was made), and
+		// is learned only where the offset rule learns it.
 		if off, ok := clockOffsetOf(rt, lt, w); ok {
-			if got := dc.clockOffset(ln, off, max(rt.res, lt.res), lt.at.Sub(rt.at), w, unread, rec, resp); got.Kind == KindClockOffset || !dc.clientTests {
+			if got := dc.clockOffset(ln, off, max(rt.res, lt.res), lt.at.Sub(rt.at), w, unread, rec, resp); got.Kind == KindClockOffset || !dc.clientTests && off.Min > 0 {
 				return got
 			}
 		}
@@ -669,9 +673,14 @@ func (dc *DriftCache) noWindowRead(r, l typedInstant, w *Window, at time.Time) b
 // models.ClockOffset.CutCoarserThan): it only ever refuses more, as a
 // replay reads its value at its own resolution. ok only where one offset
 // does both: a constant offset from the clock, which a value built on a
-// served instant or a constant shows in neither run's window. Only a value
-// later than its call in both runs (each least offset above none) shows
-// one. Only an instant that names its moment (InstantLeaf) shows one: a
+// served instant or a constant shows in neither run's window. The offset is
+// signed (models.ClockOffset's signed): a value later than every read in
+// its window in both runs (each least offset above zero: an expiry) shows
+// one above zero, and one whose cut ends before every read in its window in
+// both runs (each bound, which it excludes, at or below zero: a cutoff the
+// application queries from, createdAt >= now - 2m) one below; a value
+// inside a run's window (a plain read's offsets lie around zero), or after
+// it in one run and before it in the other, shows none. Only an instant that names its moment (InstantLeaf) shows one: a
 // wall clock of no zone (a date too) stands from the clock by its zone's
 // offset as much as by one the application adds, which keploy cannot tell
 // apart, and a time of day names no day. One of two forms, outside the
@@ -704,11 +713,16 @@ func clockOffsetOf(r, l typedInstant, w *Window) (models.ClockOffset, bool) {
 	if !ok {
 		return models.ClockOffset{}, false
 	}
-	// Later than its call in both runs, as no read of the clock is: a read
-	// made before its window (before the previous call) stands from the
-	// window by how long ago it was made, which the runs' timing sets, not
-	// by an offset, and is refused as before.
-	if rlo <= 0 || llo <= 0 {
+	// On one side of its window, the same in both runs: later than every
+	// read in it (an expiry), or earlier (a cutoff). A read made before its
+	// window (before the previous call) stands from the window by how long
+	// ago it was made, which the runs' timing sets, so it shows one offset
+	// in both runs only where the two waited as long as each other to a
+	// few milliseconds, and the checks of clockOffset (a unit coarser than
+	// a second, one multiple of it in range) refuse it in all but a whole
+	// number of minutes; even then every replay compares that offset, so a
+	// read whose wait changed fails there, never passes unchecked.
+	if !(rlo > 0 && llo > 0) && !(rhi <= 0 && lhi <= 0) {
 		return models.ClockOffset{}, false
 	}
 	o := models.ClockOffset{Min: max(rlo, llo), Max: min(rhi, lhi), Res: max(r.res, l.res, grain), Layout: models.LayoutTyped}
