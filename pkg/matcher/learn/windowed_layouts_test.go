@@ -64,11 +64,12 @@ func TestEveryClockLayoutIsReadInWindows(t *testing.T) {
 	}
 }
 
-// A long script that holds a few instants is read through the patterns only
-// around them: Stripe.js's controller (1.7 MB) and its decoded forms held a
-// miss's answer up to 15 s when each pattern read all of them. With 200 KB of
-// script and three instants the patterns read no more than three windows per
-// layout; the whole text, read by each, is 6 x 200 KB.
+// A long script that holds a few instants, and numbers one digit short of an
+// epoch, is read through the patterns only around the instants: Stripe.js's
+// controller (1.7 MB) and its decoded forms held a miss's answer up to 15 s
+// when each pattern read all of them. With 700 KB of script and three
+// instants the patterns read no more than three windows per layout; the whole
+// text, read by each, is 6 x 700 KB.
 func TestALongScriptIsReadOnlyAroundItsInstants(t *testing.T) {
 	scan := layoutScan
 	defer func() { layoutScan = scan }()
@@ -77,7 +78,7 @@ func TestALongScriptIsReadOnlyAroundItsInstants(t *testing.T) {
 		read += len(s)
 		return scan(re, s)
 	}
-	script := strings.Repeat(`function(e,t){var n=e.width||0,r=t.height-1;return{x:n*2,y:r/3,id:"ab12",k:[0,1,2]}};`, 2400)
+	script := strings.Repeat(`function(e,t){var n=e.width||0,r=t.height-1;return{x:n*2,y:r/3,id:"ab12",v:123456789,k:[0,1,2]}};`, 2400)
 	s := script + `"at":"2026-10-28T07:16:21.123Z",` + script + `"t":1761635781,` + script + `"d":"Wed, 28 Oct 2026 07:16:21 GMT"`
 	spans := instantSpans(s)
 	if len(spans) < 3 {
@@ -89,6 +90,51 @@ func TestALongScriptIsReadOnlyAroundItsInstants(t *testing.T) {
 	}
 	if limit := len(instantRes) * 3 * (2*pad + 40); read > limit {
 		t.Errorf("the patterns read %d bytes of a %d-byte script holding 3 instants, want at most %d (around the instants only)", read, len(s), limit)
+	}
+}
+
+// A layout whose match is unbounded (pad -1), or a read that asks for fewer
+// than every match (n >= 0), is read over the whole text: windows would cut
+// the unbounded match short and give a limited read another count.
+func TestAnUnboundedLayoutOrALimitedReadIsReadWhole(t *testing.T) {
+	digits := strings.Repeat("1761635781", 3)
+	s := "id " + digits + " at 1761635782 and 1761635783"
+	unbounded := &layoutRe{re: regexp.MustCompile(`\d{10}\d*`), anchors: digitRuns(10), pad: -1}
+	if got, want := unbounded.FindAllStringIndex(s, -1), unbounded.re.FindAllStringIndex(s, -1); !reflect.DeepEqual(got, want) {
+		t.Errorf("unbounded layout over %q: found %v, the whole text holds %v", s, got, want)
+	}
+	for k, l := range instantRes {
+		if got, want := l.FindAllStringIndex(s, 1), l.re.FindAllStringIndex(s, 1); !reflect.DeepEqual(got, want) {
+			t.Errorf("layout %d's first match over %q: found %v, the pattern's is %v", k, s, got, want)
+		}
+	}
+}
+
+// Each layout's anchors find their own shape and nothing near it: a looser
+// anchor reads more windows than it needs (slower), a tighter one would miss
+// an instant (the generated-text row then fails).
+func TestEachAnchorFindsOnlyItsShape(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		find  func(string) [][2]int
+		s     string
+		spans [][2]int
+	}{
+		{"pairs :", digitPairsAround(':'), "07:16", [][2]int{{0, 5}}},
+		{"pairs :", digitPairsAround(':'), "a07:16:21b", [][2]int{{1, 6}, {4, 9}}},
+		{"pairs :", digitPairsAround(':'), "7:16 x7:16 x07:1 :16 07: 0x:16 07:x6", nil},
+		{"pairs -", digitPairsAround('-'), "2026-10-28", [][2]int{{2, 7}, {5, 10}}},
+		{"pairs -", digitPairsAround('-'), "t.height-1 6-10 26-1 a-b", nil},
+		{"digit T digit", digitTDigit, "1T2 1t2", [][2]int{{0, 3}, {4, 7}}},
+		{"digit T digit", digitTDigit, "T2 1T aTb xT2 1X2", nil},
+		{"uuid version", uuidVersionGroup, "-1abc- -7ABC-", [][2]int{{0, 6}, {7, 13}}},
+		{"uuid version", uuidVersionGroup, "-2abc- -1abg- -1ab- -1abc", nil},
+		{"digit runs", digitRuns(10), "a12345678901b 1234567890", [][2]int{{1, 12}, {14, 24}}},
+		{"digit runs", digitRuns(10), "123456789 12345.67890", nil},
+	} {
+		if got := c.find(c.s); !reflect.DeepEqual(got, c.spans) {
+			t.Errorf("%s over %q: found %v, want %v", c.name, c.s, got, c.spans)
+		}
 	}
 }
 
