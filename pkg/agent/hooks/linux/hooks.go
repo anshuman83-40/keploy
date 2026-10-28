@@ -878,10 +878,16 @@ func (h *Hooks) RegisterClient(ctx context.Context, opts config.Agent, rules []m
 		clientInfo.Mode = uint32(0)
 	}
 
-	ports := agent.GetPortToSendToKernel(ctx, rules)
+	sources := []agent.PassThroughSource{{
+		Knob:  "bypassRules naming only a port",
+		Ports: agent.GetPortToSendToKernel(ctx, rules),
+	}}
 
 	if agent.ExtraPassThroughPortsHook != nil {
-		ports = append(ports, agent.ExtraPassThroughPortsHook()...)
+		sources = append(sources, agent.PassThroughSource{
+			Knob:  "a pass-through port this build registers (RegisterExtraPassThroughPortsHook)",
+			Ports: agent.ExtraPassThroughPortsHook(),
+		})
 	}
 
 	// Mock mode: the wrapped test runner calls the agent's own HTTP server
@@ -890,10 +896,22 @@ func (h *Hooks) RegisterClient(ctx context.Context, opts config.Agent, rules []m
 	// scope calls would be redirected into the proxy instead of reaching the
 	// agent. Kernel-level bypass the agent's own control port.
 	if opts.MockMode && opts.AgentPort != 0 {
-		ports = append(ports, uint(opts.AgentPort))
+		sources = append(sources, agent.PassThroughSource{
+			Knob:  "keploy mock's agent API port",
+			Ports: []uint{uint(opts.AgentPort)},
+		})
 	}
 
-	for i := 0; i < 10; i++ {
+	ports, kept := agent.KernelPassThrough(sources, len(clientInfo.PassThroughPorts))
+	// The kernel leaves a pass-through port alone for every host, so in a
+	// replay each one is real egress keploy never sees.
+	if opts.Mode == models.MODE_TEST {
+		for _, s := range kept {
+			agent.LogRealEgress(h.logger, s.Knob, agent.KernelPassThroughDest, zap.Uints("ports", s.Ports))
+		}
+	}
+
+	for i := 0; i < len(clientInfo.PassThroughPorts); i++ {
 		if len(ports) <= i {
 			clientInfo.PassThroughPorts[i] = -1
 			continue

@@ -489,6 +489,11 @@ type Proxy struct {
 	// replay's DNS mock miss may then be forwarded to every dnsUpstreamServers
 	// entry, the host's and public resolvers included.
 	allowEgressDNS bool
+	// lastSessionEgress is what the last replay session's options opened
+	// (sessionEgressKnobs), so a session that opens the same is not logged
+	// again. Guarded by egressKnobsMu.
+	lastSessionEgress []egressKnob
+	egressKnobsMu     sync.Mutex
 	// dnsSearch is the resolv.conf search list, kept so a query can be
 	// recognised as a redundant search expansion without asking upstream.
 	// A resolver probes name.S for each search domain S — before the name
@@ -2099,6 +2104,7 @@ func (p *Proxy) StartProxy(ctx context.Context, opts agent.ProxyOptions) error {
 	// non-fatal: on failure the forwarder simply falls back to the
 	// legacy default response.
 	p.captureDNSUpstream()
+	p.logAgentEgressKnobs()
 
 	// Wait for the proxy server to be ready or fail
 	if err := <-readyChan; err != nil {
@@ -4268,9 +4274,7 @@ func (p *Proxy) Mock(ctx context.Context, opts models.OutgoingOptions) error {
 	}
 	p.ensureHandshakeHold(rule) // the listener may have opened in between
 
-	if !opts.Mocking {
-		p.logger.Info("🔀 Mocking is disabled, the response will be fetched from the actual service")
-	}
+	p.logSessionEgressKnobs(opts)
 
 	p.nsSwitchMutex.Lock()
 	defer p.nsSwitchMutex.Unlock()
